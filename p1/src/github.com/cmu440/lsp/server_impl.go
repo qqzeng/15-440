@@ -340,7 +340,6 @@ func (s *server) onWrite(connID int, dataMsg *Message) {
 	if ok {
 		s.mu.Unlock()
 	}
-	// fmt.Printf("===================remote address=%v, ok=%v.\n", addr, ok)
 	if _, err := s.listener.WriteToUDP(mdBytes, addr); err != nil {
 		fmt.Println(err.Error())
 		return
@@ -724,49 +723,3 @@ func (s *server) exit(deletedMap map[int]*compConn, connID int) bool {
 	}
 	return false
 }
-
-// This method should block until all pending messages for each client are sent
-// and acknowledged. If one or more clients are lost during this time, a non-nil
-// error should be returned. Once it returns, all goroutines running in the
-// background should exit.
-// func (s *server) Close() error {
-// 	// s.mu.Lock() // deadlock ?
-// 	// defer s.mu.Unlock()
-// 	// s.mu.Lock()
-// 	fmt.Printf("Server: try to close all connection..\n")
-// 	s.mu.Lock()
-// 	deletedMap := make(map[int]*compConn)
-// 	for connID, cc := range s.chanRespMap {
-// 		deletedMap[connID] = cc
-// 	}
-// 	s.mu.Unlock()
-// 	for connID, cc := range s.chanRespMap {
-// 		if len(s.chanConnOnClose) == 0 {
-// 			s.chanConnOnClose <- true
-// 		}
-// 		// s.mu.Unlock()
-// 		s.checkPendingMsg("Close", connID)
-// 		select {
-// 		case <-cc.chanMsgDone:
-// 			fmt.Printf("server: [Close] [s.chanMsgDone] Connection(%v) Acked messages, exiting now.\n", connID)
-// 			fmt.Printf("[%v] server: connection(%v), last message seqNum=%v, cc.receivedAckSeqNum=%v.\n", "Close", connID, cc.latestSentDataMsg.Last().msg.SeqNum, cc.receivedAckSeqNum)
-// 			cc.chanConnClose <- connID
-// 			if s.exit(deletedMap, connID) {
-// 				return nil
-// 			}
-// 		case <-cc.chanReadFailure:
-// 			fmt.Printf("server: [Close] [cc.chanReadFailure] Connection(%v) read error due to its closing, so we won't check Un-Ack messages, exiting now.\n", connID)
-// 			cc.chanConnClose <- connID
-// 			if s.exit(deletedMap, connID) {
-// 				return nil
-// 			}
-// 		case cid := <-s.chanReadFailure:
-// 			fmt.Printf("server: [Close] [s.chanReadFailure] Connection(%v) read error due to its closing, so we won't check Un-Ack messages, exiting now.\n", connID)
-// 			cc.chanConnClose <- cid
-// 			if s.exit(deletedMap, cid) {
-// 				return nil
-// 			}
-// 		}
-// 	}
-// 	return nil
-// }
