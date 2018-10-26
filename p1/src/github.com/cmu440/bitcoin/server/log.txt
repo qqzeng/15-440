@@ -1,2 +1,0 @@
-20:44:38.634564 server.go:84: serverNode create successfully!.
-illis: 1000, WindowSize: 3] .
