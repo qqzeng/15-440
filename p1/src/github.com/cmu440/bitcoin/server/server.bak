@@ -1,0 +1,183 @@
+package main
+
+import (
+	"container/list"
+	"fmt"
+	"github.com/cmu440/bitcoin"
+	"github.com/cmu440/lsp"
+	"log"
+	"os"
+	"strconv"
+)
+
+const (
+	name = "log.txt"
+	flag = os.O_RDWR | os.O_CREATE
+	perm = os.FileMode(0666)
+
+	// default global params
+	defaultEpochLimit  = 5
+	defaultEpochMillis = 1000
+	defaultWindowSize  = 3
+)
+
+// client reqeust struct
+type cliRequest struct {
+	connID int
+	mesg   *bitcoin.Message
+}
+
+type JobStatus int
+
+const (
+	Success JobStatus = iota
+	Fail
+	Abort
+)
+
+type job struct {
+	jobId  int
+	mesg   *bitcoin.Message
+	status JobStatus
+}
+
+type minerRequest struct {
+	connID     int
+	mesg       *bitcoin.Message
+	jobs   *list.List
+	chanJobOpt chan bool
+}
+
+type serverNode struct {
+	srv               lsp.Server
+	cliRequestList    *list.List // client request list
+	chanCliRequest    chan bool  // non-buffered channel, synchronize list operation, i.e. read and write
+	chanExit          chan bool
+	minerRequestList  *list.List // minner join request list
+	chanMinnerRequest chan bool  // non-buffered channel, synchronize list operation, i.e. read and write
+	params            *lsp.Params
+	logger            *log.Logger
+}
+
+func main() {
+	const numArgs = 2
+	if len(os.Args) != numArgs {
+		fmt.Println("Usage: ./server <port>")
+		return
+	}
+
+	// TODO: implement this!
+	port, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		fmt.Println("Port error!")
+		return
+	}
+	sn := createServerNode(port)
+	sn.logger.Printf("serverNode create successfully!.\n")
+
+}
+
+func (sn *serverNode) splitRequests() {
+    for {
+        select {
+            
+        }
+    }
+}
+
+func (sn *serverNode) updateMinerMesg(connID int, data *bitcoin.Message) {
+
+}
+
+func (sn *serverNode) cacheMinerMesg(connID int, data *bitcoin.Message) {
+    // wait for goroutine read the minerRequestList.
+    sn.chanMinnerRequest <- true
+    minerReq := &minerRequest{
+        connID: connID,
+        mesg:   data,
+        jobs: list.New(), // initial empty job list.
+    }
+    sn.minerRequestList.PushBack(minerReq)
+    sn.logger.Printf("Server cached Join message %s from minner %d.\n", string(data), connID)
+    <-sn.chanMinnerRequest
+}
+
+func (sn. *serverNode) cacheCliMesg(connID int, data *bitcoin.Message) {
+	// wait for goroutine read the cliRequestList.
+	sn.chanCliRequest <- true
+	cliReq := &cliRequest{
+		connID: connID,
+		mesg:   data,
+	}
+	sn.cliRequestList.PushBack(cliReq)
+	sn.logger.Printf("Server cached Client message %s from client %d.\n", string(data), connID)
+    <-sn.chanCliRequest
+}
+
+func (sn *serverNode) handleMesg() {
+	defer sn.logger.Println("Server shutting down...")
+	for {
+		select {
+		case <-sn.chanExit:
+			return
+		default:
+			connID, data, err := sn.srv.Read()
+			if err != nil {
+				sn.logger.Println("Server received error during read.")
+				return
+			}
+			sn.logger.Printf("Server read message %s from client %d.\n", string(data), connID)
+			mesg, err := data.(*Message)
+			switch mesg.Type {
+			case bitcoin.Join:
+				go sn.cacheMinerMesg(connID, data)
+            case bitcoin.Request:
+                go sn.cacheCliMesg(connID, data)
+            case bitcoin.Result:
+                go sn.updateMinerMesg(connID, data)
+            default:
+                sn.logger.Println("Invalid message type!")
+			}
+		}
+	}
+}
+
+func createServerNode(port int) *serverNode {
+	sn := &serverNode {
+        cliRequestList: list.New(), 
+        minerRequestList: list.New(),
+        chanCliRequest: make(chan bool, 1),
+        chanMinnerRequest: make(chan bool, 1),
+    }
+	logger, err := buildLogger()
+	if err != nil {
+		fmt.Println("Logger build error: ", err)
+		return nil
+	}
+	sn.logger = logger
+	sn.params = makeParams()
+	srv, err := lsp.NewServer(port, sn.params)
+	if err != nil {
+		sn.logger.Printf("Failed to start server on port %d: %s\n", port, err)
+		return nil
+	}
+	sn.srv = srv
+	return sn
+}
+
+func buildLogger() (*log.Logger, error) {
+	file, err := os.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	LOGF := log.New(file, "", log.Lshortfile|log.Lmicroseconds)
+	return LOGF, nil
+}
+
+func makeParams() *lsp.Params {
+	return &lsp.Params{
+		EpochLimit:  defaultEpochLimit,
+		EpochMillis: defaultEpochMillis,
+		WindowSize:  defaultWindowSize,
+	}
+}

@@ -2,8 +2,13 @@ package main
 
 import (
 	"fmt"
+	"lsp"
 	"os"
 )
+
+type clientNode struct {
+	cli lsp.Client
+}
 
 func main() {
 	const numArgs = 4
