@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	CHAN_SIZE_UNIT = 2
+	CHAN_SIZE_UNIT = 1
 )
 
 type minerNode struct {
