@@ -12,18 +12,17 @@ import (
 )
 
 const (
-	CHAN_SIZE_SMALL = 3
+	CHAN_SIZE_UNIT = 1
 )
 
 type clientNode struct {
-	cnID       int
-	cli        lsp.Client
-	mu         sync.Mutex
-	logger     *log.Logger
-	lf         *os.File
-	chanOnExit chan bool
-	chanExit   chan bool
-	params     *lsp.Params
+	cnID     int
+	cli      lsp.Client
+	mu       sync.Mutex
+	logger   *log.Logger
+	lf       *os.File
+	chanExit chan bool
+	params   *lsp.Params
 }
 
 func main() {
@@ -32,15 +31,20 @@ func main() {
 		fmt.Println("Usage: ./client <hostport> <message> <maxNonce>")
 		return
 	}
-	maxNonce, err := strconv.Atoi(os.Args[3])
+	upper, err := strconv.ParseUint(os.Args[3], 10, 32)
 	if err != nil {
 		fmt.Println("maxNonce error!")
 		return
 	}
-	cn := createClientNode(os.Args[1])
-	cn.sendServerRequest(os.Args[2], uint64(maxNonce))
-	go cn.handleStuff()
-	cn.exit()
+	cn, err := createClientNode(os.Args[1])
+	if err != nil {
+		return
+	}
+	if err := cn.sendServerRequest(os.Args[2], upper); err != nil {
+		return
+	}
+	cn.handleStuff()
+	go cn.exit()
 }
 
 // printResult prints the final result to stdout.
@@ -54,54 +58,51 @@ func printDisconnected() {
 }
 
 func (cn *clientNode) handleMesg(mesg *bitcoin.Message) {
-	printResult(string(mesg.Hash), string(mesg.Nonce))
+	hash := strconv.FormatUint(mesg.Hash, 10)
+	nonce := strconv.FormatUint(mesg.Nonce, 10)
+	printResult(hash, nonce)
 }
 
-func (cn *clientNode) sendServerRequest(data string, maxNonce uint64) {
+func (cn *clientNode) sendServerRequest(data string, maxNonce uint64) error {
 	mesg := bitcoin.NewRequest(data, 0, maxNonce)
 	mdBytes, _ := json.Marshal(mesg)
-	if err := cn.cli.Write(mdBytes); err != nil {
+	err := cn.cli.Write(mdBytes)
+	if err != nil {
 		printDisconnected()
-		for i := 0; i < CHAN_SIZE_SMALL; i++ {
-			cn.chanOnExit <- true
-		}
-		cn.logger.Printf("Client(%v) fails to send message(%v) to server, error: %v.\n", cn.cnID, mesg.String(), err.Error())
-		return
+		cn.chanExit <- true
+		return err
 	}
 	cn.logger.Printf("Client(%v) send message(%v) to server successfully.\n", cn.cnID, mesg.String())
+	return nil
 }
 
 func (cn *clientNode) handleStuff() {
 	defer cn.logger.Printf("Client(%v) is exiting.\n", cn.cnID)
 	for {
-		select {
-		case <-cn.chanOnExit:
+		data, err := cn.cli.Read()
+		if err != nil {
+			printDisconnected()
+			cn.chanExit <- true
+			cn.logger.Println("Client received error during read.")
 			return
-		default:
-			data, err := cn.cli.Read()
-			if err != nil {
-				printDisconnected()
-				cn.logger.Println("Client received error during read.")
-				return
-			}
-			var mesg bitcoin.Message
-			json.Unmarshal(data, &mesg)
-			cn.logger.Printf("Client read message %s from server.\n", mesg.String())
-			if mesg.Type != bitcoin.Result {
-				cn.logger.Printf("Unsupported message type: %v!", bitcoin.Request)
-			} else {
-				cn.handleMesg(&mesg)
-			}
+		}
+		var mesg bitcoin.Message
+		json.Unmarshal(data, &mesg)
+		cn.logger.Printf("Client read message %s from server.\n", mesg.String())
+		if mesg.Type != bitcoin.Result {
+			cn.logger.Printf("Unsupported message type: %v!", bitcoin.Request)
+		} else {
+			cn.handleMesg(&mesg)
 		}
 	}
 }
 
-func createClientNode(hostport string) *clientNode {
+func createClientNode(hostport string) (*clientNode, error) {
 	cn := &clientNode{cnID: bitcoin.GetNextClientId()}
 	logger, lf, err := bitcoin.BuildLogger()
 	if err != nil {
 		fmt.Println("Logger build error: ", err)
-		return nil
+		return nil, err
 	}
 	cn.logger = logger
 	cn.lf = lf
@@ -110,11 +111,13 @@ func createClientNode(hostport string) *clientNode {
 	if err != nil {
 		cn.logger.Printf("Client failed to connect to server(%v): %s.", hostport, err)
 		printDisconnected()
-		return nil
+		cn.chanExit <- true
+		return nil, err
 	}
 	cn.cli = cli
+	cn.chanExit = make(chan bool, CHAN_SIZE_UNIT)
 	cn.logger.Println("Miner node created.")
-	return cn
+	return cn, nil
 }
 
 func (cn *clientNode) exit() {
@@ -123,7 +126,6 @@ func (cn *clientNode) exit() {
 		case <-cn.chanExit:
 			// close client connection.
 			cn.cli.Close()
-			close(cn.chanOnExit)
 			close(cn.chanExit)
 			cn.logger.Printf("Miner(%v) closed connection and exited.\n", cn.cnID)
 			// close log file.
