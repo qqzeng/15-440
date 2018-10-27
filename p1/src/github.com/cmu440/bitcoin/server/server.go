@@ -65,6 +65,7 @@ type serverNode struct {
 	chanExit       chan bool
 	chanOnExit     chan bool
 	chanCommonMesg chan *commonMesg
+	chanCliRequest chan bool
 	cp             *clientPool
 	mp             *minerPool
 	params         *lsp.Params
@@ -87,7 +88,7 @@ func main() {
 	sn := createServerNode(port)
 	go sn.readMesg()
 	go sn.handleStuff()
-	go sn.exit()
+	sn.exit()
 }
 
 func (sn *serverNode) readMesg() {
@@ -104,15 +105,16 @@ func (sn *serverNode) readMesg() {
 				sn.logger.Println("Server received error during read.")
 				closed = true
 			}
-			var mesg *bitcoin.Message
-			json.Unmarshal(data, mesg)
-			sn.logger.Printf("Server read message %s from client %d.\n", mesg.String(), connID)
+			var mesg bitcoin.Message
+			json.Unmarshal(data, &mesg)
+			sn.logger.Printf("Server read message %s from node %d.\n", mesg.String(), connID)
 			cm := &commonMesg{
 				connID:  connID,
-				mesg:    mesg,
+				mesg:    &mesg,
 				isClose: closed,
 			}
 			sn.chanCommonMesg <- cm
+			sn.logger.Println("server send request chanCommonMesg")
 		}
 	}
 }
@@ -149,12 +151,17 @@ func (sn *serverNode) removeClientRequest(connID int) {
 }
 
 func (sn *serverNode) recycleTask(connID int, mr *minerRequest) {
-	delete(sn.mp.minerMap, connID)
-	if _, ok := sn.cp.clientMap[mr.runningTask.connID]; ok {
-		sn.mp.taskList.PushBack(mr.runningTask)
+	if _, ok := sn.mp.minerMap[connID]; ok {
+		delete(sn.mp.minerMap, connID)
+	}
+	if mr != nil && mr.runningTask != nil {
+		if _, ok := sn.cp.clientMap[mr.runningTask.connID]; ok {
+			sn.mp.taskList.PushBack(mr.runningTask)
+		}
 	}
 }
 
+// TODO: if there is no task, then it will loop forever.
 func (sn *serverNode) assignTask(mr *minerRequest) {
 	if e := sn.mp.taskList.Front(); e != nil {
 		t := e.Value.(*task)
@@ -162,6 +169,7 @@ func (sn *serverNode) assignTask(mr *minerRequest) {
 		sn.sendMinerRequest(mr.connID, t.mesg)
 		sn.mp.taskList.Remove(e)
 	} else { // empty task list.
+		// wait for new client request to submit task.
 		sn.mp.chanIdleMiners <- mr
 	}
 }
@@ -209,6 +217,11 @@ func (sn *serverNode) handleClientMesg(cm *commonMesg) {
 		overMinerNum: 0,
 	}
 	sn.mp.taskList.PushBackList(tl)
+	// select {
+	// case <-sn.chanCliRequest:
+	// 	sn.logger.Println("Server received new client request, and notify miner.")
+	// default:
+	// }
 }
 
 func (sn *serverNode) handleMinerResult(cm *commonMesg) {
@@ -277,6 +290,7 @@ func createServerNode(port int) *serverNode {
 	}
 	sn := &serverNode{
 		chanOnExit:     make(chan bool, CHAN_SIZE_SMALL),
+		chanCliRequest: make(chan bool, 1),
 		chanCommonMesg: make(chan *commonMesg, CHAN_SIZE_UNIT),
 		cp:             cp,
 		mp:             mp,

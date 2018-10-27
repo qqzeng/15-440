@@ -39,6 +39,7 @@ func main() {
 	}
 	go mn.readMesg()
 	go mn.handleStuff()
+	mn.exit()
 }
 
 func (mn *minerNode) sendServerJoin() error {
@@ -91,13 +92,13 @@ func (mn *minerNode) readMesg() {
 				mn.logger.Println("Miner received error during read.")
 				return
 			}
-			var mesg *bitcoin.Message
-			json.Unmarshal(data, mesg)
+			var mesg bitcoin.Message
+			json.Unmarshal(data, &mesg)
 			mn.logger.Printf("Miner read message %s from server.\n", mesg.String())
 			if mesg.Type != bitcoin.Request {
 				mn.logger.Printf("Unsupported message type: %v!", bitcoin.Request)
 			} else {
-				mn.chanRequestMesg <- mesg
+				mn.chanRequestMesg <- &mesg
 			}
 		}
 	}

@@ -40,6 +40,7 @@ func main() {
 	cn := createClientNode(os.Args[1])
 	cn.sendServerRequest(os.Args[2], uint64(maxNonce))
 	go cn.handleStuff()
+	cn.exit()
 }
 
 // printResult prints the final result to stdout.
@@ -83,13 +84,13 @@ func (cn *clientNode) handleStuff() {
 				cn.logger.Println("Client received error during read.")
 				return
 			}
-			var mesg *bitcoin.Message
-			json.Unmarshal(data, mesg)
+			var mesg bitcoin.Message
+			json.Unmarshal(data, &mesg)
 			cn.logger.Printf("Client read message %s from server.\n", mesg.String())
 			if mesg.Type != bitcoin.Result {
 				cn.logger.Printf("Unsupported message type: %v!", bitcoin.Request)
 			} else {
-				cn.handleMesg(mesg)
+				cn.handleMesg(&mesg)
 			}
 		}
 	}
