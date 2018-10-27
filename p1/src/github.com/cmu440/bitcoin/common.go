@@ -18,13 +18,13 @@ const (
 	defaultWindowSize  = 3
 )
 
-func BuildLogger() (*log.Logger, error) {
+func BuildLogger() (*log.Logger, *os.File, error) {
 	file, err := os.OpenFile(name, flag, perm)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	LOGF := log.New(file, "", log.Lshortfile|log.Lmicroseconds)
-	return LOGF, nil
+	return LOGF, file, nil
 }
 
 func MakeParams() *lsp.Params {
