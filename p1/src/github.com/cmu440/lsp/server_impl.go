@@ -186,8 +186,8 @@ func (s *server) handStuff(connID int) {
 			cc.remainEpoch--
 			if cc.remainEpoch == 0 {
 				fmt.Printf("Server: read from client fail, exit from connection(%v).\n", connID)
-				// s.chanReadFailure <- connID
-				cc.chanReadFailure <- connID
+				s.chanReadFailure <- connID
+				// cc.chanReadFailure <- connID
 				s.mu.Unlock()
 				return
 			}
@@ -479,7 +479,7 @@ func (s *server) Read() (int, []byte, error) {
 			} else {
 				fmt.Printf("server: [Read] connection(%v) closed, but the server may not detect it.\n", cid)
 			}
-			return -1, nil, errors.New(fmt.Sprintf("server read from connection(%v) fail.\n", cid))
+			return cid, nil, errors.New(fmt.Sprintf("server read from connection(%v) fail.\n", cid))
 		case message := <-s.chanMsgData:
 			fmt.Printf("=========server: read data(%v) from client by connection(%v).\n", string(message.Payload), message.ConnID)
 			return message.ConnID, message.Payload, nil
