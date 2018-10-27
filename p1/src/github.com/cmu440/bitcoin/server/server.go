@@ -9,51 +9,67 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"sync"
+)
+
+const (
+	POOL_SIZE       = 1024
+	CHAN_SIZE_UNIT  = 1
+	CHAN_SIZE_SMALL = 3
 )
 
 // client reqeust struct
-type cliRequest struct {
-	connID int
-	mesg   *bitcoin.Message
+type commonMesg struct {
+	connID  int
+	mesg    *bitcoin.Message
+	isClose bool
 }
 
-type JobStatus int
+type clientRequest struct {
+	workMinerNum int
+	overMinerNum int
+	resultHash   uint64
+	resultNonce  uint64
+}
+
+type clientPool struct {
+	clientMap map[int]*clientRequest
+}
+
+type TaskStatus int
 
 const (
-	Completed JobStatus = iota
+	Completed TaskStatus = iota
 	Running
 	Abort
 )
 
-type job struct {
-	jobId    int
-	mesg     *bitcoin.Message
-	rsltMesg *bitcoin.Message
-	status   JobStatus
-}
-
-type work struct {
-	jobId  int
-	jobNum int
-	connID int // client connection id
+type task struct {
+	connID int
+	mesg   *bitcoin.Message
+	status TaskStatus
 }
 
 type minerRequest struct {
-	connID int
-	mesg   *bitcoin.Message
-	jobs   *list.List
+	connID      int
+	runningTask *task
+}
+
+type minerPool struct {
+	minerMap       map[int]*minerRequest
+	chanIdleMiners chan *minerRequest
+	taskList       *list.List
 }
 
 type serverNode struct {
-	mu              sync.Mutex
-	srv             lsp.Server
-	chanExit        chan bool
-	chanCliRequest  chan *cliRequest
-	minerRequestMap map[int]*minerRequest // minner join request map
-	workList        *list.List
-	params          *lsp.Params
-	logger          *log.Logger
+	srv            lsp.Server
+	chanExit       chan bool
+	chanOnExit     chan bool
+	chanCommonMesg chan *commonMesg
+	cp             *clientPool
+	mp             *minerPool
+	params         *lsp.Params
+	logger         *log.Logger
+	lf             *os.File
 }
 
 func main() {
@@ -69,165 +85,209 @@ func main() {
 		return
 	}
 	sn := createServerNode(port)
+	go sn.readMesg()
 	go sn.handleStuff()
-	go sn.distributeRequests()
+	go sn.exit()
 }
 
-func (sn *serverNode) sendMinerRequest() {
-	sn.logger.Printf("server begin to send message to miners.\n")
-	sn.mu.Lock()
-	defer sn.mu.Unlock()
-	for connID, mr := range sn.minerRequestMap {
-		mesg := mr.jobs.Front().Value.(*job).mesg
-		mdBytes, _ := json.Marshal(mesg)
-		sn.srv.Write(connID, mdBytes)
-		// TODO: handle miner failures
-		sn.logger.Printf("server finishes sending message(%v) to miner(%v).\n", mesg.String(), connID)
+func (sn *serverNode) readMesg() {
+	defer sn.logger.Printf("[readMesg] Server is exiting.\n")
+	for {
+		select {
+		case <-sn.chanOnExit:
+			sn.chanExit <- true
+			return
+		default:
+			connID, data, err := sn.srv.Read()
+			closed := false
+			if err != nil {
+				sn.logger.Println("Server received error during read.")
+				closed = true
+			}
+			var mesg *bitcoin.Message
+			json.Unmarshal(data, mesg)
+			sn.logger.Printf("Server read message %s from client %d.\n", mesg.String(), connID)
+			cm := &commonMesg{
+				connID:  connID,
+				mesg:    mesg,
+				isClose: closed,
+			}
+			sn.chanCommonMesg <- cm
+		}
 	}
-	sn.logger.Printf("server finishes send message to miners.\n")
+}
+
+func (sn *serverNode) sendMinerRequest(connID int, mesg *bitcoin.Message) {
+	sn.logger.Printf("server begins to send message to miner(%v).\n", connID)
+	mdBytes, _ := json.Marshal(mesg)
+	err := sn.srv.Write(connID, mdBytes)
+	if err != nil { // if write fails, then assign this job to another miner.
+		sn.logger.Printf("server fails to write message(%v) to miner(%v).\n", mesg.String(), connID)
+	}
+	sn.logger.Printf("server finishes sending message(%v) to miner(%v).\n", mesg.String(), connID)
 }
 
 func (sn *serverNode) sendClientResult(connID int, mesg *bitcoin.Message) {
 	sn.logger.Printf("server begin to send message to miners.\n")
 	mdBytes, _ := json.Marshal(mesg)
-	// TODO: handle client failures, e.g. connection lost
 	if err := sn.srv.Write(connID, mdBytes); err != nil {
-		sn.logger.Printf("server abort sending result(%v) to client(%v) due to connection lost.\n", mesg.String(), connID)
-	}
-}
-
-func (sn *serverNode) distributeRequests() {
-	for {
-		select {
-		// Process one request at a time
-		case cliReq := <-sn.chanCliRequest:
-			sn.mu.Lock()
-			start := cliReq.mesg.Lower
-			// assign the request to all live minners. no load balance stragety.
-			avg := (cliReq.mesg.Upper - cliReq.mesg.Lower) / uint64(len(sn.minerRequestMap))
-			jobId := bitcoin.GetNextJobId()
-			w := &work{jobId: jobId, jobNum: len(sn.minerRequestMap), connID: cliReq.connID}
-			sn.workList.PushBack(w)
-			i := 1
-			end := start + avg
-			for _, mr := range sn.minerRequestMap {
-				if i == len(sn.minerRequestMap) {
-					end = cliReq.mesg.Upper + 1 // including upper number
-				} else {
-					end = start + avg
-				}
-				// sub-message reqeust handled by per miner
-				msg := bitcoin.NewRequest(cliReq.mesg.Data, start, end)
-				job := &job{
-					jobId:  jobId,
-					mesg:   msg,
-					status: Running,
-				}
-				mr.jobs.PushBack(job)
-				start = end
-				i++
-			}
-			sn.mu.Unlock()
-			sn.sendMinerRequest()
-		}
-	}
-}
-
-func (sn *serverNode) updateMinerMesg(connID int, mesg *bitcoin.Message) {
-	sn.mu.Lock()
-	defer sn.mu.Unlock()
-	jobs := sn.minerRequestMap[connID].jobs
-	j := jobs.Front().Value.(*job)
-	j.status = Completed
-	j.rsltMesg = mesg
-	successJobNum := 0
-	e := sn.workList.Front()
-	if e == nil {
+		sn.logger.Printf("server aborts sending result(%v) to client(%v) due to connection lost.\n", mesg.String(), connID)
 		return
 	}
-	w := e.Value.(*work)
-	resultHash := ^uint64(0) - 1 // max uint - 1 (1<<64 - 1)
-	resultNonce := uint64(1)
-	for _, mr := range sn.minerRequestMap {
-		if e := mr.jobs.Front(); e != nil {
-			j := (e.Value).(*job)
-			if j.status == Completed && w.jobId == j.jobId {
-				successJobNum += 1
-				if j.rsltMesg.Hash < resultHash { // find the least hash.
-					resultHash = j.rsltMesg.Hash
-					resultNonce = j.rsltMesg.Nonce
-				}
+}
+
+func (sn *serverNode) cacheMinerMesg(cm *commonMesg) {
+	mr := &minerRequest{connID: cm.connID, runningTask: nil}
+	sn.mp.minerMap[cm.connID] = mr
+	sn.mp.chanIdleMiners <- mr
+	sn.logger.Printf("Server cached Join message %s from minner(%d).\n", cm.mesg.String(), cm.connID)
+}
+
+func (sn *serverNode) removeClientRequest(connID int) {
+	delete(sn.cp.clientMap, connID)
+	sn.srv.CloseConn(connID)
+}
+
+func (sn *serverNode) recycleTask(connID int, mr *minerRequest) {
+	delete(sn.mp.minerMap, connID)
+	if _, ok := sn.cp.clientMap[mr.runningTask.connID]; ok {
+		sn.mp.taskList.PushBack(mr.runningTask)
+	}
+}
+
+func (sn *serverNode) assignTask(mr *minerRequest) {
+	if e := sn.mp.taskList.Front(); e != nil {
+		t := e.Value.(*task)
+		mr.runningTask = t
+		sn.sendMinerRequest(mr.connID, t.mesg)
+		sn.mp.taskList.Remove(e)
+	} else { // empty task list.
+		sn.mp.chanIdleMiners <- mr
+	}
+}
+
+func (sn *serverNode) distributeTasks(cm *commonMesg) *list.List {
+	taskList := list.New()
+	workMinerNum := len(sn.mp.minerMap)
+	if workMinerNum == 0 {
+		workMinerNum = 10
+	}
+	avg := (cm.mesg.Upper - cm.mesg.Lower) / uint64(workMinerNum)
+	if avg != 0 {
+		i := 1
+		start := cm.mesg.Lower
+		end := start + avg
+		for i = 1; i <= workMinerNum; i++ {
+			if i == workMinerNum {
+				end = cm.mesg.Upper + 1 // including upper number
+			} else {
+				end = start + avg
+			}
+			t := &task{
+				connID: cm.connID,
+				mesg:   bitcoin.NewRequest(cm.mesg.Data, start, end),
+			}
+			taskList.PushBack(t)
+			start = end
+		}
+	} else {
+		t := task{
+			connID: cm.connID,
+			mesg:   bitcoin.NewRequest(cm.mesg.Data, cm.mesg.Lower, cm.mesg.Upper),
+		}
+		taskList.PushBack(&t)
+	}
+	return taskList
+}
+
+func (sn *serverNode) handleClientMesg(cm *commonMesg) {
+	tl := sn.distributeTasks(cm)
+	sn.cp.clientMap[cm.connID] = &clientRequest{
+		resultHash:   ^uint64(0) - 1,
+		resultNonce:  uint64(1),
+		workMinerNum: tl.Len(),
+		overMinerNum: 0,
+	}
+	sn.mp.taskList.PushBackList(tl)
+}
+
+func (sn *serverNode) handleMinerResult(cm *commonMesg) {
+	if mr, ok := sn.mp.minerMap[cm.connID]; ok {
+		t := mr.runningTask
+		mr.runningTask = nil // ready for new task.
+		sn.mp.chanIdleMiners <- mr
+		if cr, ok := sn.cp.clientMap[t.connID]; ok {
+			cr.overMinerNum++
+			if cr.resultHash > cm.mesg.Hash {
+				cr.resultHash = cm.mesg.Hash
+				cr.resultNonce = cm.mesg.Nonce
+			}
+			if cr.overMinerNum == cr.workMinerNum {
+				rsltMesg := bitcoin.NewResult(cr.resultHash, cr.resultNonce)
+				sn.sendClientResult(t.connID, rsltMesg)
+				sn.removeClientRequest(t.connID)
 			}
 		}
 	}
-	if successJobNum == w.jobNum {
-		sn.sendClientResult(w.connID, bitcoin.NewResult(resultHash, resultNonce))
-	}
-}
-
-func (sn *serverNode) cacheMinerMesg(connID int, mesg *bitcoin.Message) {
-	sn.mu.Lock()
-	minerReq := &minerRequest{
-		connID: connID,
-		mesg:   mesg,
-		jobs:   list.New(), // initial empty job list.
-	}
-	sn.logger.Printf("Server cached Join message %s from minner(%d).\n", mesg.String(), connID)
-	sn.minerRequestMap[connID] = minerReq
-	sn.mu.Unlock()
-}
-
-func (sn *serverNode) cacheCliMesg(connID int, mesg *bitcoin.Message) {
-	cliReq := &cliRequest{
-		connID: connID,
-		mesg:   mesg,
-	}
-	sn.chanCliRequest <- cliReq
-	sn.logger.Printf("Server cached Client message %s from client(%d).\n", mesg.String(), connID)
 }
 
 func (sn *serverNode) handleStuff() {
-	defer sn.logger.Printf("Server exiting.\n")
+	defer sn.logger.Printf("[handleStuff] Server is exiting.\n")
 	for {
 		select {
-		case <-sn.chanExit:
+		case <-sn.chanOnExit:
+			sn.chanExit <- true
 			return
-		default:
-			connID, data, err := sn.srv.Read()
-			if err != nil {
-				sn.logger.Println("Server received error during read.")
-				return
+		case cm := <-sn.chanCommonMesg:
+			if cm.isClose {
+				// client connection lost, aborting sending result.
+				if _, ok := sn.cp.clientMap[cm.connID]; ok {
+					sn.removeClientRequest(cm.connID)
+				} else {
+					// miner connection lost, recycle this task and re-assign it to another miner next.
+					if mr, ok := sn.mp.minerMap[cm.connID]; ok {
+						sn.recycleTask(cm.connID, mr)
+					}
+				}
+			} else {
+				switch cm.mesg.Type {
+				case bitcoin.Join:
+					sn.cacheMinerMesg(cm)
+				case bitcoin.Request:
+					sn.handleClientMesg(cm)
+				case bitcoin.Result:
+					sn.handleMinerResult(cm)
+				default:
+					sn.logger.Println("Invalid message type: Unknow Message Type!")
+				}
 			}
-			// mesg, err := data.(*Message)
-			var mesg *bitcoin.Message
-			json.Unmarshal(data, mesg)
-			sn.logger.Printf("Server read message %s from client %d.\n", mesg.String(), connID)
-			switch mesg.Type {
-			case bitcoin.Join:
-				go sn.cacheMinerMesg(connID, mesg)
-			case bitcoin.Request:
-				go sn.cacheCliMesg(connID, mesg)
-			case bitcoin.Result:
-				go sn.updateMinerMesg(connID, mesg)
-			default:
-				sn.logger.Println("Invalid message type: Unknow Message Type!")
-			}
+		case mr := <-sn.mp.chanIdleMiners:
+			sn.assignTask(mr)
 		}
 	}
 }
 
 func createServerNode(port int) *serverNode {
-	sn := &serverNode{
-		minerRequestMap: make(map[int]*minerRequest),
-		workList:        list.New(),
-		chanCliRequest:  make(chan *cliRequest, 1),
+	// only one client request in normal case.
+	cp := &clientPool{clientMap: make(map[int]*clientRequest)}
+	mp := &minerPool{
+		taskList:       list.New(),
+		chanIdleMiners: make(chan *minerRequest, POOL_SIZE),
+		minerMap:       make(map[int]*minerRequest),
 	}
-	logger, err := bitcoin.BuildLogger()
+	sn := &serverNode{
+		chanOnExit:     make(chan bool, CHAN_SIZE_SMALL),
+		chanCommonMesg: make(chan *commonMesg, CHAN_SIZE_UNIT),
+		cp:             cp,
+		mp:             mp,
+	}
+	logger, lf, err := bitcoin.BuildLogger()
 	if err != nil {
 		fmt.Println("Logger build error: ", err)
 		return nil
 	}
 	sn.logger = logger
+	sn.lf = lf
 	sn.params = bitcoin.MakeParams()
 	srv, err := lsp.NewServer(port, sn.params)
 	if err != nil {
@@ -237,4 +297,20 @@ func createServerNode(port int) *serverNode {
 	sn.srv = srv
 	sn.logger.Printf("serverNode create successfully!.\n")
 	return sn
+}
+
+func (sn *serverNode) exit() {
+	for {
+		select {
+		case <-sn.chanExit:
+			// close server.
+			sn.srv.Close()
+			close(sn.chanOnExit)
+			close(sn.chanExit)
+			sn.logger.Printf("Server closed connection and exited.\n")
+			// close log file.
+			sn.lf.Close()
+			return
+		}
+	}
 }
