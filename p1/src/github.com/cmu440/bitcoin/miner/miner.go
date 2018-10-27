@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	CHAN_SIZE_SMALL = 2
+	CHAN_SIZE_UNIT = 2
 )
 
 type minerNode struct {
@@ -34,39 +34,27 @@ func main() {
 	}
 
 	mn := createMinerNode(os.Args[1])
-	if mn.sendServerJoin() != nil {
-		return
-	}
+	mn.sendServerJoin()
 	go mn.readMesg()
 	go mn.handleStuff()
 	mn.exit()
 }
 
-func (mn *minerNode) sendServerJoin() error {
+func (mn *minerNode) sendServerJoin() {
 	join := bitcoin.NewJoin()
 	mdBytes, _ := json.Marshal(join)
-	err := mn.cli.Write(mdBytes)
-	if err != nil {
-		fmt.Println("Miner(%v) fails send join to server: %v.\n", mn.mnID, err.Error())
-		return err
-	}
-	return nil
+	mn.cli.Write(mdBytes)
 }
 
 func (mn *minerNode) sendServerResult(mesg *bitcoin.Message) {
 	mdBytes, _ := json.Marshal(mesg)
-	if err := mn.cli.Write(mdBytes); err != nil {
-		for i := 0; i < CHAN_SIZE_SMALL; i++ {
-			mn.chanOnExit <- true
-		}
-		mn.logger.Printf("Miner(%v) fails to send message(%v) to server, error: %v.\n", mn.mnID, mesg.String(), err.Error())
-	}
+	mn.cli.Write(mdBytes)
 	mn.logger.Printf("Miner(%v) send message(%v) to server successfully.\n", mn.mnID, mesg.String())
 }
 
 func (mn *minerNode) handleMesg(mesg *bitcoin.Message) *bitcoin.Message {
 	mn.logger.Printf("Miner(%v) begin to handle message(%v).\n", mn.mnID, mesg.String())
-	resultHash := ^uint64(0) - 1 // max uint - 1
+	resultHash := ^uint64(0) - 1 // max uint64 - 1
 	resultNonce := uint64(1)
 	for i := mesg.Lower; i < mesg.Upper; i++ {
 		hv := bitcoin.Hash(mesg.Data, i)
@@ -83,23 +71,20 @@ func (mn *minerNode) handleMesg(mesg *bitcoin.Message) *bitcoin.Message {
 func (mn *minerNode) readMesg() {
 	defer mn.logger.Printf("[readMesg] Miner(%v) read exiting.\n", mn.mnID)
 	for {
-		select {
-		case <-mn.chanOnExit:
-			return
-		default:
-			data, err := mn.cli.Read()
-			if err != nil {
-				mn.logger.Println("Miner received error during read.")
-				return
+		data, err := mn.cli.Read()
+		if err != nil {
+			mn.logger.Println("Miner received error during read.")
+			for i := 0; i < CHAN_SIZE_UNIT; i++ {
+				mn.chanExit <- true
 			}
-			var mesg bitcoin.Message
-			json.Unmarshal(data, &mesg)
-			mn.logger.Printf("Miner read message %s from server.\n", mesg.String())
-			if mesg.Type != bitcoin.Request {
-				mn.logger.Printf("Unsupported message type: %v!", bitcoin.Request)
-			} else {
-				mn.chanRequestMesg <- &mesg
-			}
+		}
+		var mesg bitcoin.Message
+		json.Unmarshal(data, &mesg)
+		mn.logger.Printf("Miner read message %s from server.\n", mesg.String())
+		if mesg.Type != bitcoin.Request {
+			mn.logger.Printf("Unsupported message type: %v!", bitcoin.Request)
+		} else {
+			mn.chanRequestMesg <- &mesg
 		}
 	}
 }
@@ -133,8 +118,9 @@ func createMinerNode(hostport string) *minerNode {
 		return nil
 	}
 	mn.cli = cli
-	mn.chanOnExit = make(chan bool, CHAN_SIZE_SMALL)
-	mn.chanExit = make(chan bool, CHAN_SIZE_SMALL)
+	mn.chanRequestMesg = make(chan *bitcoin.Message, CHAN_SIZE_UNIT)
+	mn.chanOnExit = make(chan bool, CHAN_SIZE_UNIT)
+	mn.chanExit = make(chan bool, CHAN_SIZE_UNIT)
 	mn.logger.Println("Miner node created.")
 	return mn
 }
@@ -153,4 +139,5 @@ func (mn *minerNode) exit() {
 			return
 		}
 	}
+
 }
