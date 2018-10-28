@@ -11,10 +11,6 @@ import (
 	"sync"
 )
 
-const (
-	CHAN_SIZE_UNIT = 1
-)
-
 type clientNode struct {
 	cnID     int
 	cli      lsp.Client
@@ -31,7 +27,7 @@ func main() {
 		fmt.Println("Usage: ./client <hostport> <message> <maxNonce>")
 		return
 	}
-	upper, err := strconv.ParseUint(os.Args[3], 10, 32)
+	maxNonce, err := strconv.ParseUint(os.Args[3], 10, 64)
 	if err != nil {
 		fmt.Println("maxNonce error!")
 		return
@@ -40,7 +36,7 @@ func main() {
 	if err != nil {
 		return
 	}
-	if err := cn.sendServerRequest(os.Args[2], upper); err != nil {
+	if err := cn.sendServerRequest(os.Args[2], maxNonce); err != nil {
 		return
 	}
 	cn.handleStuff()
@@ -115,7 +111,7 @@ func createClientNode(hostport string) (*clientNode, error) {
 		return nil, err
 	}
 	cn.cli = cli
-	cn.chanExit = make(chan bool, CHAN_SIZE_UNIT)
+	cn.chanExit = make(chan bool, bitcoin.ChanSizeUnit)
 	cn.logger.Println("Miner node created.")
 	return cn, nil
 }

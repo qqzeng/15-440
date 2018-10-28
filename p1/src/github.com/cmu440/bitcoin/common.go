@@ -16,6 +16,11 @@ const (
 	defaultEpochLimit  = 5
 	defaultEpochMillis = 1000
 	defaultWindowSize  = 3
+
+	// channel size
+	ChanSizeUnit = 1
+
+	DefaultTaskNum = 5
 )
 
 func BuildLogger() (*log.Logger, *os.File, error) {
@@ -35,10 +40,10 @@ func MakeParams() *lsp.Params {
 	}
 }
 
-var nextJobId int32 = 0
+var nextRequestId int32 = 0
 
-func GetNextJobId() int {
-	return int(atomic.AddInt32(&nextJobId, 1))
+func GetNextRequestId() int {
+	return int(atomic.AddInt32(&nextRequestId, 1))
 }
 
 var nextMinerNodeId int32 = 0

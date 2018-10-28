@@ -12,9 +12,8 @@ import (
 )
 
 const (
-	POOL_SIZE       = 1024
-	CHAN_SIZE_UNIT  = 1
-	CHAN_SIZE_SMALL = 3
+	pool_size       = 1024
+	chan_size_small = 3
 )
 
 // client reqeust struct
@@ -25,6 +24,7 @@ type commonMesg struct {
 }
 
 type clientRequest struct {
+	requestID    int
 	workMinerNum int
 	overMinerNum int
 	resultHash   uint64
@@ -32,7 +32,7 @@ type clientRequest struct {
 }
 
 type clientPool struct {
-	clientMap map[int]*clientRequest
+	clientMap map[int]*clientRequest // client.connID => clientRequest
 }
 
 type TaskStatus int
@@ -44,20 +44,21 @@ const (
 )
 
 type task struct {
-	connID int
+	connID int // client.connID
 	mesg   *bitcoin.Message
 	status TaskStatus
 }
 
 type minerRequest struct {
 	connID      int
-	runningTask *task
+	runningTask *task // current running task.
 }
 
 type minerPool struct {
-	minerMap       map[int]*minerRequest
+	minerMap       map[int]*minerRequest // miner.connID => minerReqeust
 	chanIdleMiners chan *minerRequest
-	taskList       *list.List
+	taskListMap    map[int]*list.List // client.connID => taskList
+	//one client request corresponds to one map slot and one map slot corresponds to many tasks.
 }
 
 type serverNode struct {
@@ -65,7 +66,6 @@ type serverNode struct {
 	chanExit       chan bool
 	chanOnExit     chan bool
 	chanCommonMesg chan *commonMesg
-	chanCliRequest chan bool
 	cp             *clientPool
 	mp             *minerPool
 	params         *lsp.Params
@@ -101,7 +101,7 @@ func (sn *serverNode) readMesg() {
 		default:
 			connID, data, err := sn.srv.Read()
 			closed := false
-			if err != nil {
+			if err != nil { // may be the connection lost.
 				sn.logger.Println("Server received error during read.")
 				closed = true
 			}
@@ -155,30 +155,35 @@ func (sn *serverNode) recycleTask(connID int, mr *minerRequest) {
 		delete(sn.mp.minerMap, connID)
 	}
 	if mr != nil && mr.runningTask != nil {
-		if _, ok := sn.cp.clientMap[mr.runningTask.connID]; ok {
-			sn.mp.taskList.PushBack(mr.runningTask)
+		cmID := mr.runningTask.connID
+		if _, ok := sn.cp.clientMap[cmID]; ok {
+			if _, ok1 := sn.mp.taskListMap[cmID]; ok1 {
+				sn.mp.taskListMap[cmID].PushBack(mr.runningTask)
+			}
 		}
 	}
 }
 
 // TODO: if there is no task, then it will loop forever.
 func (sn *serverNode) assignTask(mr *minerRequest) {
-	if e := sn.mp.taskList.Front(); e != nil {
-		t := e.Value.(*task)
-		mr.runningTask = t
-		sn.sendMinerRequest(mr.connID, t.mesg)
-		sn.mp.taskList.Remove(e)
-	} else { // empty task list.
-		// wait for new client request to submit task.
-		sn.mp.chanIdleMiners <- mr
+	for _, taskList := range sn.mp.taskListMap {
+		if e := taskList.Front(); e != nil {
+			t := e.Value.(*task)
+			mr.runningTask = t
+			sn.sendMinerRequest(mr.connID, t.mesg)
+			taskList.Remove(e)
+			return
+		}
 	}
+	// re-put the miner to idle miner channel.
+	sn.mp.chanIdleMiners <- mr
 }
 
 func (sn *serverNode) distributeTasks(cm *commonMesg) *list.List {
 	taskList := list.New()
 	workMinerNum := len(sn.mp.minerMap)
 	if workMinerNum == 0 {
-		workMinerNum = 10
+		workMinerNum = bitcoin.DefaultTaskNum
 	}
 	avg := (cm.mesg.Upper - cm.mesg.Lower) / uint64(workMinerNum)
 	if avg != 0 {
@@ -199,6 +204,7 @@ func (sn *serverNode) distributeTasks(cm *commonMesg) *list.List {
 			start = end
 		}
 	} else {
+		// assign to a signle miner or one nonce per miner.
 		t := task{
 			connID: cm.connID,
 			mesg:   bitcoin.NewRequest(cm.mesg.Data, cm.mesg.Lower, cm.mesg.Upper),
@@ -211,12 +217,13 @@ func (sn *serverNode) distributeTasks(cm *commonMesg) *list.List {
 func (sn *serverNode) handleClientMesg(cm *commonMesg) {
 	tl := sn.distributeTasks(cm)
 	sn.cp.clientMap[cm.connID] = &clientRequest{
+		requestID:    bitcoin.GetNextRequestId(),
 		resultHash:   ^uint64(0) - 1,
 		resultNonce:  uint64(1),
 		workMinerNum: tl.Len(),
 		overMinerNum: 0,
 	}
-	sn.mp.taskList.PushBackList(tl)
+	sn.mp.taskListMap[cm.connID] = tl
 	// select {
 	// case <-sn.chanCliRequest:
 	// 	sn.logger.Println("Server received new client request, and notify miner.")
@@ -284,14 +291,13 @@ func createServerNode(port int) *serverNode {
 	// only one client request in normal case.
 	cp := &clientPool{clientMap: make(map[int]*clientRequest)}
 	mp := &minerPool{
-		taskList:       list.New(),
-		chanIdleMiners: make(chan *minerRequest, POOL_SIZE),
+		taskListMap:    make(map[int]*list.List),
+		chanIdleMiners: make(chan *minerRequest, pool_size),
 		minerMap:       make(map[int]*minerRequest),
 	}
 	sn := &serverNode{
-		chanOnExit:     make(chan bool, CHAN_SIZE_SMALL),
-		chanCliRequest: make(chan bool, 1),
-		chanCommonMesg: make(chan *commonMesg, CHAN_SIZE_UNIT),
+		chanOnExit:     make(chan bool, chan_size_small),
+		chanCommonMesg: make(chan *commonMesg, bitcoin.ChanSizeUnit),
 		cp:             cp,
 		mp:             mp,
 	}

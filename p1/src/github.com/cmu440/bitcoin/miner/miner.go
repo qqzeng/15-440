@@ -10,10 +10,6 @@ import (
 	"sync"
 )
 
-const (
-	CHAN_SIZE_UNIT = 1
-)
-
 type minerNode struct {
 	mnID            int
 	cli             lsp.Client
@@ -74,9 +70,8 @@ func (mn *minerNode) readMesg() {
 		data, err := mn.cli.Read()
 		if err != nil {
 			mn.logger.Println("Miner received error during read.")
-			for i := 0; i < CHAN_SIZE_UNIT; i++ {
-				mn.chanExit <- true
-			}
+			mn.chanOnExit <- true
+			return
 		}
 		var mesg bitcoin.Message
 		json.Unmarshal(data, &mesg)
@@ -94,6 +89,7 @@ func (mn *minerNode) handleStuff() {
 	for {
 		select {
 		case <-mn.chanOnExit:
+			mn.chanExit <- true
 			return
 		case mesg := <-mn.chanRequestMesg:
 			resultMesg := mn.handleMesg(mesg)
@@ -118,9 +114,9 @@ func createMinerNode(hostport string) *minerNode {
 		return nil
 	}
 	mn.cli = cli
-	mn.chanRequestMesg = make(chan *bitcoin.Message, CHAN_SIZE_UNIT)
-	mn.chanOnExit = make(chan bool, CHAN_SIZE_UNIT)
-	mn.chanExit = make(chan bool, CHAN_SIZE_UNIT)
+	mn.chanRequestMesg = make(chan *bitcoin.Message, bitcoin.ChanSizeUnit)
+	mn.chanOnExit = make(chan bool, bitcoin.ChanSizeUnit)
+	mn.chanExit = make(chan bool, bitcoin.ChanSizeUnit)
 	mn.logger.Println("Miner node created.")
 	return mn
 }
