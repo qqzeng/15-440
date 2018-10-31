@@ -15,26 +15,26 @@ import (
 
 const (
 	chanSizeUint = 1
+	TickInterval = 1000
 )
 
 type storageServer struct {
 	// TODO: implement this!
-	rwmu              sync.RWMutex           // guards read and write for hash table
-	mu                sync.Mutex             // lock for normal case
-	keysMutex         map[string]*sync.Mutex // guards safely access the specific key, also imporve performance.
-	ht                map[string]interface{} // hash table for storage, the value type is either string or string array.
-	master            uint32                 // master's nodeID in storage cluster to identify the master
-	nodes             []storagerpc.Node      // including storage server id and its host:port address, nodeID => Node{nodeID, hostport}
-	peers             map[string]*rpc.Client // peers for rpc, nodeID => *rpc.Client, including the master
-	masterPeer        *rpc.Client
+	rwmu              sync.RWMutex              // guards read and write for hash table
+	mu                sync.Mutex                // lock for normal case
+	keysMutex         map[string]*sync.Mutex    // guards safely access the specific key, also imporve performance.
+	ht                map[string]interface{}    // hash table for storage, the value type is either string or string array.
+	nodes             []storagerpc.Node         // all storage servers info, Node{nodeID, hostport}
+	peers             map[string]*rpc.Client    // peers for rpc, hostport => *rpc.Client, including the master
+	masterPeer        *rpc.Client               // master's rpc hub for slaves send rpc request.
 	connSrvs          map[uint32]bool           // connected servers only for master. nodeID => isConnected
 	listener          net.Listener              // listener for listening rpc requests.
 	nodeCnt           int                       // number of slaves
 	nodeID            uint32                    // node id of current server
 	initStartComplete chan bool                 // signal for all peers have joined the consistent hash ring.
 	sortedNodeIds     []uint32                  // sorted key
-	leaseDuration     map[string]map[string]int // leaseTime for <key, node>: key => hostport array => liveDuration (second)
-
+	leaseDuration     map[string]map[string]int // lease duration for <key, node>: key => hostport array => liveDuration (second)
+	leaseTicker       *time.Ticker              // update lease live duration for every one second.
 	// nodes      map[uint32]storagerpc.Node // including storage server id and its host:port address, nodeID => Node{nodeID, hostport}
 }
 
@@ -49,13 +49,14 @@ type storageServer struct {
 func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID uint32) (StorageServer, error) {
 	ss := &storageServer{
 		keysMutex:         make(map[string]*sync.Mutex),
-		ht:                make(map[string][]byte),
+		ht:                make(map[string]interface{}),
 		peers:             make(map[string]*rpc.Client),
 		connSrvs:          make(map[uint32]bool),
 		nodeCnt:           numNodes,
 		nodeID:            nodeID,
 		initStartComplete: make(chan bool, chanSizeUint),
 		leaseDuration:     make(map[string]map[string]int),
+		leaseTicker:       time.NewTicker(TickInterval * time.Millisecond),
 	}
 	if err := ss.buildRPCListen(port); err != nil {
 		return nil, err
@@ -82,6 +83,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 			return ss, nil // only one server, i.e. the master.
 		}
 	}
+	go ss.updateLeaseDurationRegularly() // update leases live duration regularly.
 	return ss, nil
 }
 
@@ -104,6 +106,7 @@ func (ss *storageServer) joinHashRing(masterServerHostPort string) error {
 		return err
 	}
 	ss.masterPeer = p
+	ss.peers[masterServerHostPort] = p
 	// slave sends register rpc to master.
 	var reply storagerpc.RegisterReply
 	args := &storagerpc.RegisterArgs{ServerInfo: *ss.nodes[ss.nodeID]}
@@ -167,7 +170,7 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 		reply.Status = storagerpc.OK
 		reply.Value = v.(string)
 		if args.WantLease {
-			ss.setLeaseTimeForKeyNodePair(args.Key, args.HostPort, storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)
+			ss.setLeaseDurationForKeyNodePair(args.Key, args.HostPort, storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)
 		}
 		reply.Lease = storagerpc.Lease{
 			Granted:      args.WantLease,
@@ -296,6 +299,7 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	return nil
 }
 
+// route key stored node using consistent hash ring.
 func (ss *storageServer) checkKeyRoute(key string) bool {
 	partitionKeys := strings.Split(key, ":")
 	slotNo := libstore.StoreHash(partitionKeys[0])
@@ -303,7 +307,7 @@ func (ss *storageServer) checkKeyRoute(key string) bool {
 		for _, node = range ss.nodes {
 			ss.sortedNodeIds = append(ss.sortedNodeIds, node.NodeID)
 		}
-		sort.Sort(ss.sortedNodeIds)
+		sort.Slice(ss.sortedNodeIds, func(i, j int) bool { return ss.sortedNodeIds[i] < ss.sortedNodeIds[j] })
 	}
 	// use binary search to find the right nodeID.
 	idx := sort.Search(len(ss.sortedNodeIds), func(i int) bool { return ss.sortedNodeIds[i] >= slotNo })
@@ -376,7 +380,7 @@ func (ss *storageServer) sendRevokeReleaseRPC(key string, hp string, wg *sync.Wa
 		ss.peers[hp] = p
 	}
 	var reply storagerpc.RevokeLeaseReply
-	args := &RevokeLeaseArgs{Key: key}
+	args := &storagerpc.RevokeLeaseArgs{Key: key}
 	err := ss.peers[hp].Call("LeaseCallbacks.RevokeLease", args, &reply)
 	if err != nil {
 		return
@@ -394,4 +398,25 @@ func (ss *storageServer) checkLeaseExpiry(key string, hp string) bool {
 		return true
 	}
 	return ss.leaseTime[key][hp] <= 0
+}
+
+func (ss *storageServer) updateLeaseDurationRegularly() {
+	for {
+		select {
+		case <-ss.leaseTicker:
+			ss.rwmu.Lock()
+			for key, hps = range ss.leaseDuration {
+				for hp, ld = range hps {
+					ss.leaseDuration[key][hp] = ld - 1
+					if ss.leaseDuration[key][hp] <= 0 {
+						delete(ss.leaseDuration[key], hp)
+					}
+				}
+				if len(hps) == 0 {
+					delete(ss.leaseDuration, key)
+				}
+			}
+			ss.rwmu.Unlock()
+		}
+	}
 }
