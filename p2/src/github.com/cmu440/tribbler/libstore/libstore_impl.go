@@ -82,7 +82,7 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		wantLeaseTicker:   time.NewTicker(TickInterval / 100 * time.Millisecond),
 	}
 	serverLogFile, _ := os.OpenFile("log_libstore", os.O_RDWR|os.O_CREATE, 0666)
-	logger = log.New(serverLogFile, "[Libstore]", log.Lmicroseconds|log.Lshortfile)
+	logger = log.New(serverLogFile, "[Libstore] ", log.Lmicroseconds|log.Lshortfile)
 	if myHostPort == "" {
 		ls.leaseMode = Never
 	}
@@ -159,7 +159,7 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 		return err
 	}
 	if reply.Status == storagerpc.ItemNotFound {
-		return errors.New(fmt.Sprintf("Storage server(%v) response ItemNotFound for (%v => %v).", nodeID, key, removeItem))
+		return errors.New("ItemNotFound")
 	}
 	if reply.Status != storagerpc.OK {
 		return errors.New(fmt.Sprintf("Storage server(%v) response RemoveFromList fail for (%v => %v).", nodeID, key, removeItem))
@@ -178,7 +178,7 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 		return err
 	}
 	if reply.Status == storagerpc.ItemExists {
-		return errors.New(fmt.Sprintf("Storage server(%v) response ItemExists for (%v => %v).", nodeID, key, newItem))
+		return errors.New("ItemExists")
 	}
 	if reply.Status != storagerpc.OK {
 		return errors.New(fmt.Sprintf("Storage server(%v) response AppendToList fail for (%v => %v)", nodeID, key, newItem))
@@ -298,14 +298,13 @@ func (ls *libstore) sendGetRPCAndCacheResult(key string, nodeID uint32, methodCa
 		}
 		return resValue, err
 	}
-	if reply.Status == storagerpc.KeyNotFound || reply.Value == "" {
-		return resValue, errors.New(fmt.Sprintf("Storage server(%v) response KeyNotFound for %v.", nodeID, key))
-	}
-	// if args.WantLease {
-	// 	if !reply.Lease.Granted {
-	// 		return resValue, errors.New(fmt.Sprintf("Storage master(%v) fail to grant lease for %v.", nodeID, key))
-	// 	}
+	// if reply.Status == storagerpc.KeyNotFound || reply.Value == "" {
+	// if reply.Status == storagerpc.KeyNotFound {
+	// 	return resValue, errors.New("KeyNotFound")
 	// }
+	if reply.Status != storagerpc.OK {
+		return resValue, errors.New("Error Get  " + fmt.Sprintf("%s :  %v", key, reply.Status))
+	}
 	ls.rwmu.Lock()
 	// if args.WantLease {
 	if reply.Lease.Granted {
@@ -349,14 +348,14 @@ func (ls *libstore) sendGetListRPCAndCacheResult(key string, nodeID uint32, meth
 		}
 		return resValue, err
 	}
-	if reply.Status == storagerpc.KeyNotFound || len(reply.Value) == 0 {
-		return resValue, errors.New(fmt.Sprintf("Storage server(%v) response KeyNotFound for %v.", nodeID, key))
+	// if reply.Status == storagerpc.KeyNotFound || len(reply.Value) == 0 {
+	if reply.Status == storagerpc.KeyNotFound {
+		// return resValue, errors.New("KeyNotFound")
+		return resValue, nil
 	}
-	// if args.WantLease {
-	// 	if !reply.Lease.Granted {
-	// 		return resValue, errors.New(fmt.Sprintf("Storage master(%v) fail to grant lease for %v.", nodeID, key))
-	// 	}
-	// }
+	if reply.Status != storagerpc.OK {
+		return nil, errors.New("Error GetList")
+	}
 	ls.rwmu.Lock()
 	// if args.WantLease {
 	if reply.Lease.Granted {

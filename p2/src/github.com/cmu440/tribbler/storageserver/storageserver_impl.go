@@ -66,22 +66,18 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		leaseTicker:       time.NewTicker(TickInterval * time.Millisecond),
 	}
 	serverLogFile, _ := os.OpenFile("log_storage."+fmt.Sprintf("%d", port), os.O_RDWR|os.O_CREATE, 0666)
-	logger = log.New(serverLogFile, "[Storage]", log.Lmicroseconds|log.Lshortfile)
+	logger = log.New(serverLogFile, "#[Storage] ", log.Lmicroseconds|log.Lshortfile)
 	if err := ss.buildRPCListen(port); err != nil {
 		return nil, err
 	}
+	node := storagerpc.Node{
+		NodeID:   nodeID,
+		HostPort: fmt.Sprintf("localhost:%d", port),
+	}
 	if masterServerHostPort == "" { // master first saves info for itself
-		node := storagerpc.Node{
-			NodeID:   nodeID,
-			HostPort: fmt.Sprintf("localhost:%d", port),
-		}
 		ss.nodes = append(ss.nodes, node)
 		ss.connSrvs[nodeID] = true
 	} else { // slave joins consisent hash ring
-		node := storagerpc.Node{
-			NodeID:   nodeID,
-			HostPort: fmt.Sprintf("localhost:%d", port),
-		}
 		if err := ss.joinHashRing(masterServerHostPort, node); err != nil {
 			return nil, err
 		}
@@ -105,8 +101,13 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 func (ss *storageServer) buildRPCListen(port int) error {
 	// master register itself to listen connections from other nodes.
-	rpc.RegisterName("StorageServer", storagerpc.Wrap(ss))
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	var err error
+	var l net.Listener
+	err = rpc.RegisterName("StorageServer", storagerpc.Wrap(ss))
+	if err != nil {
+		return err
+	}
+	l, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		logger.Println("Master failed to listen: ", err)
 		return err
@@ -167,6 +168,8 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 }
 
 func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *storagerpc.GetServersReply) error {
+	ss.rwmu.Lock()
+	defer ss.rwmu.Unlock()
 	logger.Printf("libstore GetServers from stroage server(%v), len(Servers)=%v.\n", ss.nodeID, len(ss.nodes))
 	if len(ss.nodes) == ss.nodeCnt {
 		reply.Status = storagerpc.OK
@@ -216,7 +219,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	km.Lock()
 	defer km.Unlock()
 	v, ok := ss.ht[args.Key]
-	if !ok {
+	if !ok { //|| len(v.([]string)) == 0
 		reply.Status = storagerpc.KeyNotFound
 	} else {
 		reply.Status = storagerpc.OK
