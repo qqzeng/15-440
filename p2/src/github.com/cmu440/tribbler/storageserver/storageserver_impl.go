@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"github.com/cmu440/tribbler/libstore"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
+	"log"
 	"net"
 	"net/http"
 	"net/rpc"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +41,10 @@ type storageServer struct {
 	// nodes      map[uint32]storagerpc.Node // including storage server id and its host:port address, nodeID => Node{nodeID, hostport}
 }
 
+var (
+	logger *log.Logger
+)
+
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
 // is the master storage server's host:port address. If empty, then this server
 // is the master; otherwise, this server is a slave. numNodes is the total number of
@@ -59,7 +65,8 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		leaseDuration:     make(map[string]map[string]int),
 		leaseTicker:       time.NewTicker(TickInterval * time.Millisecond),
 	}
-
+	serverLogFile, _ := os.OpenFile("log_storage."+fmt.Sprintf("%d", port), os.O_RDWR|os.O_CREATE, 0666)
+	logger = log.New(serverLogFile, "[Storage]", log.Lmicroseconds|log.Lshortfile)
 	if err := ss.buildRPCListen(port); err != nil {
 		return nil, err
 	}
@@ -71,14 +78,20 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		ss.nodes = append(ss.nodes, node)
 		ss.connSrvs[nodeID] = true
 	} else { // slave joins consisent hash ring
-		if err := ss.joinHashRing(masterServerHostPort); err != nil {
+		node := storagerpc.Node{
+			NodeID:   nodeID,
+			HostPort: fmt.Sprintf("localhost:%d", port),
+		}
+		if err := ss.joinHashRing(masterServerHostPort, node); err != nil {
 			return nil, err
 		}
 	}
 	if masterServerHostPort == "" {
 		if ss.nodeCnt > 1 {
+			logger.Printf("Storage master(%v) wait for slaves joining...\n", nodeID)
 			select {
 			case <-ss.initStartComplete: // wait for all nodes join
+				logger.Printf("Storage master(%v) complete starting.\n", nodeID)
 				// return ss, nil
 			}
 		}
@@ -95,7 +108,7 @@ func (ss *storageServer) buildRPCListen(port int) error {
 	rpc.RegisterName("StorageServer", storagerpc.Wrap(ss))
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		fmt.Println("Master failed to listen: ", err)
+		logger.Println("Master failed to listen: ", err)
 		return err
 	}
 	ss.listener = l
@@ -104,7 +117,8 @@ func (ss *storageServer) buildRPCListen(port int) error {
 	return nil
 }
 
-func (ss *storageServer) joinHashRing(masterServerHostPort string) error {
+func (ss *storageServer) joinHashRing(masterServerHostPort string, node storagerpc.Node) error {
+	logger.Printf("slave(%v) begin to join hash ring.\n", ss.nodeID)
 	p, err := rpc.DialHTTP("tcp", masterServerHostPort)
 	if err != nil {
 		return err
@@ -113,7 +127,7 @@ func (ss *storageServer) joinHashRing(masterServerHostPort string) error {
 	ss.peers[masterServerHostPort] = p
 	// slave sends register rpc to master.
 	var reply storagerpc.RegisterReply
-	args := &storagerpc.RegisterArgs{ServerInfo: ss.nodes[ss.nodeID]}
+	args := &storagerpc.RegisterArgs{ServerInfo: node}
 	ready := false // TODO: may setup a timer
 	for !ready {
 		err := ss.masterPeer.Call("StorageServer.RegisterServer", args, &reply)
@@ -122,6 +136,7 @@ func (ss *storageServer) joinHashRing(masterServerHostPort string) error {
 		}
 		if reply.Status == storagerpc.OK {
 			ss.nodes = reply.Servers
+			logger.Printf("slave(%v) successfully join hash ring.\n", ss.nodeID)
 			return nil
 		}
 		time.Sleep(time.Millisecond * 1000) // not ready, sleep
@@ -136,7 +151,9 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 	if _, joined := ss.connSrvs[node.NodeID]; !joined {
 		ss.nodes = append(ss.nodes, node)
 		ss.connSrvs[node.NodeID] = true
+		logger.Printf("node(%v) has joined the hash ring, current joined nodes number is %v.\n", node.NodeID, len(ss.nodes))
 		if len(ss.nodes) == ss.nodeCnt {
+			logger.Printf("all nodes have joined the hash ring.\n")
 			ss.initStartComplete <- true
 		}
 	}
@@ -150,9 +167,11 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 }
 
 func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *storagerpc.GetServersReply) error {
+	logger.Printf("libstore GetServers from stroage server(%v), len(Servers)=%v.\n", ss.nodeID, len(ss.nodes))
 	if len(ss.nodes) == ss.nodeCnt {
 		reply.Status = storagerpc.OK
 		reply.Servers = ss.nodes
+		logger.Printf("libstore successfully GetServers from stroage server(%v), len(Servers)=%v.\n", ss.nodeID, len(ss.nodes))
 	} else {
 		reply.Status = storagerpc.NotReady
 	}
@@ -160,6 +179,7 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 }
 
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
+	logger.Printf("libstore begin to get key=%v from stroage server(%v).\n", args.Key, ss.nodeID)
 	// check whether the key belongs to the storage range of this peer
 	if right := ss.checkKeyRoute(args.Key); !right {
 		reply.Status = storagerpc.WrongServer
@@ -182,6 +202,7 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 			ValidSeconds: storagerpc.LeaseSeconds,
 		}
 	}
+	logger.Printf("libstore successfully get <%v,%v> from stroage server(%v).\n", args.Key, reply.Value, ss.nodeID)
 	return nil
 }
 
@@ -212,6 +233,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 }
 
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
+	logger.Printf("libstore begin to put <%v,%v> to stroage server(%v).\n", args.Key, args.Value, ss.nodeID)
 	if right := ss.checkKeyRoute(args.Key); !right {
 		reply.Status = storagerpc.WrongServer
 		return nil
@@ -233,6 +255,7 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	wg.Wait()
 	ss.ht[args.Key] = args.Value
 	reply.Status = storagerpc.OK
+	logger.Printf("libstore successfully put <%v,%v> to stroage server(%v).\n", args.Key, args.Value, ss.nodeID)
 	return nil
 }
 

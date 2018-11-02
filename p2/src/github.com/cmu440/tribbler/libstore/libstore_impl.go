@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/cmu440/tribbler/rpc/librpc"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
+	"log"
 	"net/rpc"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -14,8 +16,12 @@ import (
 
 const (
 	maxRetryCnt   = 5
-	retryInterval = 500
+	retryInterval = 1000
 	TickInterval  = 1000
+)
+
+var (
+	logger *log.Logger
 )
 
 type libstore struct {
@@ -75,6 +81,8 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		keyWantLease:      make(map[string]bool),
 		wantLeaseTicker:   time.NewTicker(TickInterval / 100 * time.Millisecond),
 	}
+	serverLogFile, _ := os.OpenFile("log_libstore", os.O_RDWR|os.O_CREATE, 0666)
+	logger = log.New(serverLogFile, "[Libstore]", log.Lmicroseconds|log.Lshortfile)
 	if myHostPort == "" {
 		ls.leaseMode = Never
 	}
@@ -103,8 +111,10 @@ func (ls *libstore) Get(key string) (string, error) {
 	ls.rwmu.RUnlock()
 	// select route nodeID for the key.
 	nodeID := ls.routeNode(key)
+	logger.Printf("node begin to get  key=%v from stroage server(%v).\n", key, nodeID)
 	// send Get RPC to storage master and cache result.
 	res, err := ls.sendGetRPCAndCacheResult(key, nodeID, "Get")
+	logger.Printf("node successfully get  <%v,%v> from stroage server(%v).\n", key, res, nodeID)
 	return res, err
 }
 
@@ -115,12 +125,14 @@ func (ls *libstore) Put(key, value string) error {
 		Value: value,
 	}
 	nodeID := ls.routeNode(key)
+	logger.Printf("node begin put <%v, %v> to stroage server(%v).\n", key, value, nodeID)
 	if err := ls.peers[nodeID].Call("StorageServer.Put", args, &reply); err != nil {
 		return err
 	}
 	if reply.Status != storagerpc.OK {
 		return errors.New(fmt.Sprintf("Storage Server(%v) Put (%v => %v) error", nodeID, key, value))
 	}
+	logger.Printf("node successfully put <%v, %v> to stroage server(%v).\n", key, value, nodeID)
 	return nil
 }
 
@@ -190,23 +202,27 @@ func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storage
 }
 
 func (ls *libstore) getSrvsFromStorageSrvMaster(mshp string) error {
+	logger.Printf("node begin to DialHTTP (%v).\n", mshp)
 	p, err := rpc.DialHTTP("tcp", mshp)
 	if err != nil {
 		return err
 	}
 	ls.masterPeer = p
+	logger.Printf("node successfully DialHTTP (%v).\n", mshp)
 	// ls.peers[mshp] = p // cache master connection
 	// libstore(tribserver) sends getServerList rpc to storageServer master to get all storage servers.
 	var reply storagerpc.GetServersReply
 	args := &storagerpc.GetServersArgs{}
 	retryCnt := 1
 	for retryCnt <= maxRetryCnt {
+		logger.Printf("node begin to getSrvsFromStorageSrvMaster (%v).\n", mshp)
 		err := ls.masterPeer.Call("StorageServer.GetServers", args, &reply)
 		if err != nil {
 			return err
 		}
 		if reply.Status == storagerpc.OK {
 			ls.nodes = reply.Servers
+			logger.Printf("node successfully getSrvsFromStorageSrvMaster (%v).\n", mshp)
 			for _, node := range ls.nodes { // cache map: nodeID => hostport
 				ls.srvs[node.NodeID] = node.HostPort
 			}
@@ -216,6 +232,7 @@ func (ls *libstore) getSrvsFromStorageSrvMaster(mshp string) error {
 					ls.sortedNodeIds = append(ls.sortedNodeIds, node.NodeID)
 					continue
 				}
+				logger.Printf("node begin to DialHTTP to (%v).\n", node.HostPort)
 				p, err := rpc.DialHTTP("tcp", node.HostPort)
 				if err != nil {
 					fmt.Println(err.Error())
@@ -223,8 +240,10 @@ func (ls *libstore) getSrvsFromStorageSrvMaster(mshp string) error {
 				}
 				ls.peers[node.NodeID] = p
 				ls.sortedNodeIds = append(ls.sortedNodeIds, node.NodeID)
+				logger.Printf("node successfully DialHTTP to (%v).\n", node.HostPort)
 			}
 			sort.Slice(ls.sortedNodeIds, func(i, j int) bool { return ls.sortedNodeIds[i] < ls.sortedNodeIds[j] })
+			logger.Printf("node successfully getSrvsFromStorageSrvMaster (%v), len(ls.peers)=%v.\n", mshp, len(ls.peers))
 			// break
 			return nil
 		}
@@ -263,20 +282,20 @@ func (ls *libstore) sendGetRPCAndCacheResult(key string, nodeID uint32, methodCa
 	err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
 	if err != nil {
 		// there have been cases where the connection is strangely disconnected, so connect to server again.
-		// var p *rpc.Client
-		// if strings.EqualFold(err.Error(), "connection is shut down") {
-		// 	p, err = rpc.DialHTTP("tcp", ls.srvs[nodeID])
-		// 	if err != nil {
-		// 		return resValue, err
-		// 	}
-		// 	ls.peers[nodeID] = p
-		// 	err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
-		// 	if err != nil {
-		// 		return resValue, err
-		// 	}
-		// } else {
-		// 	return resValue, err
-		// }
+		var p *rpc.Client
+		if strings.EqualFold(err.Error(), "connection is shut down") {
+			p, err = rpc.DialHTTP("tcp", ls.srvs[nodeID])
+			if err != nil {
+				return resValue, err
+			}
+			ls.peers[nodeID] = p
+			err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
+			if err != nil {
+				return resValue, err
+			}
+		} else {
+			return resValue, err
+		}
 		return resValue, err
 	}
 	if reply.Status == storagerpc.KeyNotFound || reply.Value == "" {
@@ -312,22 +331,22 @@ func (ls *libstore) sendGetListRPCAndCacheResult(key string, nodeID uint32, meth
 	err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
 	if err != nil {
 		// there have been cases where the connection is strangely disconnected, so connect to server again.
-		// var p *rpc.Client
-		// if strings.EqualFold(err.Error(), "connection is shut down") {
-		// 	p, err = rpc.DialHTTP("tcp", ls.srvs[nodeID])
-		// 	if err != nil {
-		// 		return resValue, err
-		// 	}
-		// 	ls.peers[nodeID] = p
-		// 	err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
-		// 	if err != nil {
-		// 		fmt.Println("[sendGetListRPCAndCacheResult]: %v", err.Error())
-		// 		return resValue, err
-		// 	}
-		// 	fmt.Println("[sendGetListRPCAndCacheResult]")
-		// } else {
-		// 	return resValue, err
-		// }
+		var p *rpc.Client
+		if strings.EqualFold(err.Error(), "connection is shut down") {
+			p, err = rpc.DialHTTP("tcp", ls.srvs[nodeID])
+			if err != nil {
+				return resValue, err
+			}
+			ls.peers[nodeID] = p
+			err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
+			if err != nil {
+				fmt.Println("[sendGetListRPCAndCacheResult]: %v", err.Error())
+				return resValue, err
+			}
+			fmt.Println("[sendGetListRPCAndCacheResult]")
+		} else {
+			return resValue, err
+		}
 		return resValue, err
 	}
 	if reply.Status == storagerpc.KeyNotFound || len(reply.Value) == 0 {
