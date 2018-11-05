@@ -126,7 +126,10 @@ func (ls *libstore) Put(key, value string) error {
 	}
 	nodeID := ls.routeNode(key)
 	logger.Printf("node begin put <%v, %v> to stroage server(%v).\n", key, value, nodeID)
-	if err := ls.peers[nodeID].Call("StorageServer.Put", args, &reply); err != nil {
+	ls.mu.Lock()
+	p := ls.peers[nodeID]
+	ls.mu.Unlock()
+	if err := p.Call("StorageServer.Put", args, &reply); err != nil {
 		return err
 	}
 	if reply.Status != storagerpc.OK {
@@ -155,7 +158,10 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 		Value: removeItem,
 	}
 	nodeID := ls.routeNode(key)
-	if err := ls.peers[nodeID].Call("StorageServer.RemoveFromList", args, &reply); err != nil {
+	ls.mu.Lock()
+	p := ls.peers[nodeID]
+	ls.mu.Unlock()
+	if err := p.Call("StorageServer.RemoveFromList", args, &reply); err != nil {
 		return err
 	}
 	if reply.Status == storagerpc.ItemNotFound {
@@ -174,7 +180,10 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 		Value: newItem,
 	}
 	nodeID := ls.routeNode(key)
-	if err := ls.peers[nodeID].Call("StorageServer.AppendToList", args, &reply); err != nil {
+	ls.mu.Lock()
+	p := ls.peers[nodeID]
+	ls.mu.Unlock()
+	if err := p.Call("StorageServer.AppendToList", args, &reply); err != nil {
 		return err
 	}
 	if reply.Status == storagerpc.ItemExists {
@@ -217,35 +226,33 @@ func (ls *libstore) getSrvsFromStorageSrvMaster(mshp string) error {
 	for retryCnt <= maxRetryCnt {
 		logger.Printf("node begin to getSrvsFromStorageSrvMaster (%v).\n", mshp)
 		err := ls.masterPeer.Call("StorageServer.GetServers", args, &reply)
-		if err != nil {
-			return err
-		}
-		if reply.Status == storagerpc.OK {
-			ls.nodes = reply.Servers
-			logger.Printf("node successfully getSrvsFromStorageSrvMaster (%v).\n", mshp)
-			for _, node := range ls.nodes { // cache map: nodeID => hostport
-				ls.srvs[node.NodeID] = node.HostPort
-			}
-			for _, node := range reply.Servers {
-				if strings.EqualFold(node.HostPort, mshp) {
-					ls.peers[node.NodeID] = ls.masterPeer
+		if err == nil {
+			if reply.Status == storagerpc.OK {
+				ls.nodes = reply.Servers
+				logger.Printf("node successfully getSrvsFromStorageSrvMaster (%v).\n", mshp)
+				for _, node := range ls.nodes { // cache map: nodeID => hostport
+					ls.srvs[node.NodeID] = node.HostPort
+				}
+				for _, node := range reply.Servers {
+					// if strings.EqualFold(node.HostPort, mshp) {
+					// 	ls.peers[node.NodeID] = ls.masterPeer
+					// 	ls.sortedNodeIds = append(ls.sortedNodeIds, node.NodeID)
+					// 	continue
+					// }
+					logger.Printf("node begin to DialHTTP to (%v).\n", node.HostPort)
+					p, err := rpc.DialHTTP("tcp", node.HostPort)
+					if err != nil {
+						fmt.Println(err.Error())
+						return err
+					}
+					ls.peers[node.NodeID] = p
 					ls.sortedNodeIds = append(ls.sortedNodeIds, node.NodeID)
-					continue
+					logger.Printf("node successfully DialHTTP to (%v).\n", node.HostPort)
 				}
-				logger.Printf("node begin to DialHTTP to (%v).\n", node.HostPort)
-				p, err := rpc.DialHTTP("tcp", node.HostPort)
-				if err != nil {
-					fmt.Println(err.Error())
-					return err
-				}
-				ls.peers[node.NodeID] = p
-				ls.sortedNodeIds = append(ls.sortedNodeIds, node.NodeID)
-				logger.Printf("node successfully DialHTTP to (%v).\n", node.HostPort)
+				sort.Slice(ls.sortedNodeIds, func(i, j int) bool { return ls.sortedNodeIds[i] < ls.sortedNodeIds[j] })
+				logger.Printf("node successfully getSrvsFromStorageSrvMaster (%v), len(ls.peers)=%v.\n", mshp, len(ls.peers))
+				return nil
 			}
-			sort.Slice(ls.sortedNodeIds, func(i, j int) bool { return ls.sortedNodeIds[i] < ls.sortedNodeIds[j] })
-			logger.Printf("node successfully getSrvsFromStorageSrvMaster (%v), len(ls.peers)=%v.\n", mshp, len(ls.peers))
-			// break
-			return nil
 		}
 		time.Sleep(retryInterval * time.Millisecond) // not ready, sleep
 		retryCnt++
@@ -279,7 +286,10 @@ func (ls *libstore) sendGetRPCAndCacheResult(key string, nodeID uint32, methodCa
 	if err = ls.decideLeaseMode(key, args); err != nil {
 		return resValue, err
 	}
-	err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
+	ls.mu.Lock()
+	p := ls.peers[nodeID]
+	ls.mu.Unlock()
+	err = p.Call("StorageServer."+methodCall, args, &reply)
 	if err != nil {
 		// there have been cases where the connection is strangely disconnected, so connect to server again.
 		var p *rpc.Client
@@ -288,8 +298,10 @@ func (ls *libstore) sendGetRPCAndCacheResult(key string, nodeID uint32, methodCa
 			if err != nil {
 				return resValue, err
 			}
+			ls.mu.Lock()
 			ls.peers[nodeID] = p
-			err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
+			ls.mu.Unlock()
+			err = p.Call("StorageServer."+methodCall, args, &reply)
 			if err != nil {
 				return resValue, err
 			}
@@ -327,7 +339,10 @@ func (ls *libstore) sendGetListRPCAndCacheResult(key string, nodeID uint32, meth
 	if err = ls.decideLeaseMode(key, args); err != nil {
 		return resValue, err
 	}
-	err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
+	ls.mu.Lock()
+	p := ls.peers[nodeID]
+	ls.mu.Unlock()
+	err = p.Call("StorageServer."+methodCall, args, &reply)
 	if err != nil {
 		// there have been cases where the connection is strangely disconnected, so connect to server again.
 		var p *rpc.Client
@@ -336,8 +351,10 @@ func (ls *libstore) sendGetListRPCAndCacheResult(key string, nodeID uint32, meth
 			if err != nil {
 				return resValue, err
 			}
+			ls.mu.Lock()
 			ls.peers[nodeID] = p
-			err = ls.peers[nodeID].Call("StorageServer."+methodCall, args, &reply)
+			ls.mu.Unlock()
+			err = p.Call("StorageServer."+methodCall, args, &reply)
 			if err != nil {
 				fmt.Println("[sendGetListRPCAndCacheResult]: %v", err.Error())
 				return resValue, err
@@ -427,7 +444,7 @@ func (ls *libstore) updateKeyWantLeaseRegularly() {
 			ls.keyWantLease[key] = false
 			continue
 		}
-		if time.Now().Sub(queryTimeWindow[0]).Minutes() > storagerpc.QueryCacheSeconds {
+		if time.Now().Sub(queryTimeWindow[0]).Seconds() > storagerpc.QueryCacheSeconds {
 			ls.keyWantLease[key] = false
 			continue
 		}

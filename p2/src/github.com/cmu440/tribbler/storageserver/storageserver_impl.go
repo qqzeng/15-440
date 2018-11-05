@@ -3,28 +3,35 @@ package storageserver
 import (
 	"errors"
 	"fmt"
-	"github.com/cmu440/tribbler/libstore"
-	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"log"
 	"net"
-	"net/http"
-	"net/rpc"
+	http "net/http"
+	rpc "net/rpc"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cmu440/tribbler/libstore"
+	"github.com/cmu440/tribbler/rpc/storagerpc"
 )
 
 const (
-	chanSizeUint = 1
+	chanSizeUnit = 1
 	TickInterval = 1000
+)
+
+var (
+	logger *log.Logger
 )
 
 type storageServer struct {
 	// TODO: implement this!
 	rwmu              sync.RWMutex              // guards read and write for hash table
 	mu                sync.Mutex                // lock for normal case
+	peerMutex         sync.Mutex                // guards client rpc handler
+	leaseMutex        sync.Mutex                // guards lease map
 	keysMutex         map[string]*sync.Mutex    // guards safely access the specific key, also imporve performance.
 	ht                map[string]interface{}    // hash table for storage, the value type is either string or string array.
 	nodes             []storagerpc.Node         // all storage servers info, Node{nodeID, hostport}
@@ -40,10 +47,6 @@ type storageServer struct {
 	leaseTicker       *time.Ticker              // update lease live duration for every one second.
 	// nodes      map[uint32]storagerpc.Node // including storage server id and its host:port address, nodeID => Node{nodeID, hostport}
 }
-
-var (
-	logger *log.Logger
-)
 
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
 // is the master storage server's host:port address. If empty, then this server
@@ -61,7 +64,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		connSrvs:          make(map[uint32]bool),
 		nodeCnt:           numNodes,
 		nodeID:            nodeID,
-		initStartComplete: make(chan bool, chanSizeUint),
+		initStartComplete: make(chan bool, chanSizeUnit),
 		leaseDuration:     make(map[string]map[string]int),
 		leaseTicker:       time.NewTicker(TickInterval * time.Millisecond),
 	}
@@ -74,7 +77,8 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		NodeID:   nodeID,
 		HostPort: fmt.Sprintf("localhost:%d", port),
 	}
-	if masterServerHostPort == "" { // master first saves info for itself
+	go ss.updateLeaseDurationRegularly() // update leases live duration regularly.
+	if masterServerHostPort == "" {      // master first saves info for itself
 		ss.nodes = append(ss.nodes, node)
 		ss.connSrvs[nodeID] = true
 	} else { // slave joins consisent hash ring
@@ -92,10 +96,9 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 			}
 		}
 		// else {
-		// 	return ss, nil // only one server, i.e. the master.
+		//  return ss, nil // only one server, i.e. the master.
 		// }
 	}
-	go ss.updateLeaseDurationRegularly() // update leases live duration regularly.
 	return ss, nil
 }
 
@@ -103,13 +106,13 @@ func (ss *storageServer) buildRPCListen(port int) error {
 	// master register itself to listen connections from other nodes.
 	var err error
 	var l net.Listener
-	err = rpc.RegisterName("StorageServer", storagerpc.Wrap(ss))
-	if err != nil {
-		return err
-	}
 	l, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		logger.Println("Master failed to listen: ", err)
+		return err
+	}
+	err = rpc.RegisterName("StorageServer", storagerpc.Wrap(ss))
+	if err != nil {
 		return err
 	}
 	ss.listener = l
@@ -125,7 +128,7 @@ func (ss *storageServer) joinHashRing(masterServerHostPort string, node storager
 		return err
 	}
 	ss.masterPeer = p
-	ss.peers[masterServerHostPort] = p
+	// ss.peers[masterServerHostPort] = p
 	// slave sends register rpc to master.
 	var reply storagerpc.RegisterReply
 	args := &storagerpc.RegisterArgs{ServerInfo: node}
@@ -248,14 +251,7 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	// 2. wait all response, and resume release for the key until all hostports response ok.
 	// 3. at the same time, check whether the key lease expires for every 500 milliseconds.
 	// 1.1 get all unexpired nodes for the key.
-	unexpiredNodes := ss.getAllUnexpiredNodes(args.Key)
-	var wg sync.WaitGroup
-	for _, hp := range unexpiredNodes {
-		wg.Add(1)
-		// 1.2 for every unexpired <key, node>, invalidate the lease.
-		go ss.invalidateLeaseForKeyNodePair(args.Key, hp, &wg)
-	}
-	wg.Wait()
+	ss.waitAllKeyLeaseExpired(args.Key)
 	ss.ht[args.Key] = args.Value
 	reply.Status = storagerpc.OK
 	logger.Printf("libstore successfully put <%v,%v> to stroage server(%v).\n", args.Key, args.Value, ss.nodeID)
@@ -270,13 +266,7 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	km := ss.getKeyMutex(args.Key)
 	km.Lock()
 	defer km.Unlock()
-	unexpiredNodes := ss.getAllUnexpiredNodes(args.Key)
-	var wg sync.WaitGroup
-	for _, hp := range unexpiredNodes {
-		wg.Add(1)
-		go ss.invalidateLeaseForKeyNodePair(args.Key, hp, &wg)
-	}
-	wg.Wait()
+	ss.waitAllKeyLeaseExpired(args.Key)
 	// check whether the appended value is duplicate.
 	values, exit := ss.ht[args.Key]
 	var vlist []string
@@ -303,13 +293,7 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	km := ss.getKeyMutex(args.Key)
 	km.Lock()
 	defer km.Unlock()
-	unexpiredNodes := ss.getAllUnexpiredNodes(args.Key)
-	var wg sync.WaitGroup
-	for _, hp := range unexpiredNodes {
-		wg.Add(1)
-		go ss.invalidateLeaseForKeyNodePair(args.Key, hp, &wg)
-	}
-	wg.Wait()
+	ss.waitAllKeyLeaseExpired(args.Key)
 	values, exit := ss.ht[args.Key]
 	var vlist []string
 	if exit {
@@ -366,6 +350,18 @@ func (ss *storageServer) setLeaseDurationForKeyNodePair(key string, hostport str
 	ss.leaseDuration[key][hostport] = liveDuration
 }
 
+func (ss *storageServer) queryleaseDuration(key, addr string) int {
+	defer ss.leaseMutex.Unlock()
+	ss.leaseMutex.Lock()
+	if _, ok := ss.leaseDuration[key]; !ok {
+		return 0
+	}
+	if _, ok := ss.leaseDuration[key][addr]; !ok {
+		return 0
+	}
+	return ss.leaseDuration[key][addr]
+}
+
 func (ss *storageServer) getAllUnexpiredNodes(key string) []string {
 	var hps []string
 	nodes, ok := ss.leaseDuration[key]
@@ -380,62 +376,67 @@ func (ss *storageServer) getAllUnexpiredNodes(key string) []string {
 	return hps
 }
 
-func (ss *storageServer) invalidateLeaseForKeyNodePair(key string, hp string, wg *sync.WaitGroup) error {
-	defer wg.Done()
-	revokeOk := make(chan bool, chanSizeUint)
-	// 1. send revokeLease rpc
-	go ss.sendRevokeReleaseRPC(key, hp, wg, revokeOk)
-	// 2. at the same time, check whether the lease has expired.
-	for {
-		select {
-		case <-revokeOk:
-			ss.setLeaseDurationForKeyNodePair(key, hp, 0)
-			return nil
-		default:
-			time.Sleep(500 * time.Millisecond)
-			if ss.checkLeaseExpiry(key, hp) { // check key's expiry for every 500 milliseconds, and return true if expired.
-				return nil
-			}
-		}
-	}
-}
-
 func (ss *storageServer) sendRevokeReleaseRPC(key string, hp string, wg *sync.WaitGroup, revokeOk chan<- bool) {
-	if _, ok := ss.peers[hp]; !ok {
-		p, err := rpc.DialHTTP("tcp", hp)
-		for err != nil {
+	var p *rpc.Client
+	var ok bool
+	var err error
+	ss.peerMutex.Lock()
+	p, ok = ss.peers[hp]
+	ss.peerMutex.Unlock()
+	if !ok {
+		p, err = rpc.DialHTTP("tcp", hp)
+		if err != nil {
 			return
-			// p, err := rpc.DialHTTP("tcp", hp)
-			// time.Sleep(requestInterval * time.Millisecond)
 		}
+		ss.peerMutex.Lock()
 		ss.peers[hp] = p
+		ss.peerMutex.Unlock()
 	}
 	var reply storagerpc.RevokeLeaseReply
 	args := &storagerpc.RevokeLeaseArgs{Key: key}
-	err := ss.peers[hp].Call("LeaseCallbacks.RevokeLease", args, &reply)
+	err = p.Call("LeaseCallbacks.RevokeLease", args, &reply)
 	if err != nil {
 		return
 	}
-	if reply.Status == storagerpc.OK || reply.Status == storagerpc.KeyNotFound {
-		revokeOk <- true
+	// if reply.Status == storagerpc.OK || reply.Status == storagerpc.KeyNotFound {
+	revokeOk <- true
+	// }
+}
+
+func (ss *storageServer) invalidateLeaseForKeyNodePair(key, addr string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	revokeOk := make(chan bool, chanSizeUnit)
+	go ss.sendRevokeReleaseRPC(key, addr, wg, revokeOk)
+	leaseTicker := time.NewTicker(time.Millisecond * 1000)
+	for {
+		select {
+		case <-leaseTicker.C:
+			if ss.queryleaseDuration(key, addr) == 0 {
+				return
+			}
+		case <-revokeOk:
+			ss.setLeaseDurationForKeyNodePair(key, addr, 0)
+			return
+		}
 	}
 }
 
-func (ss *storageServer) checkLeaseExpiry(key string, hp string) bool {
-	if _, ok := ss.leaseDuration[key]; !ok {
-		return true
+func (ss *storageServer) waitAllKeyLeaseExpired(key string) {
+	unexpiredNodes := ss.getAllUnexpiredNodes(key)
+	var wg sync.WaitGroup
+	for _, hp := range unexpiredNodes {
+		wg.Add(1)
+		// 1.2 for every unexpired <key, node>, invalidate the lease.
+		go ss.invalidateLeaseForKeyNodePair(key, hp, &wg)
 	}
-	if _, ok := ss.leaseDuration[key][hp]; !ok {
-		return true
-	}
-	return ss.leaseDuration[key][hp] <= 0
+	wg.Wait()
 }
 
 func (ss *storageServer) updateLeaseDurationRegularly() {
 	for {
 		select {
 		case <-ss.leaseTicker.C:
-			ss.rwmu.Lock()
+			ss.leaseMutex.Lock()
 			for key, hps := range ss.leaseDuration {
 				for hp, ld := range hps {
 					ss.leaseDuration[key][hp] = ld - 1
@@ -443,11 +444,11 @@ func (ss *storageServer) updateLeaseDurationRegularly() {
 						delete(ss.leaseDuration[key], hp)
 					}
 				}
-				if len(hps) == 0 {
+				if len(ss.leaseDuration[key]) == 0 {
 					delete(ss.leaseDuration, key)
 				}
 			}
-			ss.rwmu.Unlock()
+			ss.leaseMutex.Unlock()
 		}
 	}
 }
