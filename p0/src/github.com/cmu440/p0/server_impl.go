@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	msgBufferedSize  = 100
-	chanSizeUnit     = 1
-	connBufferedSize = 1
-	serverHost       = "localhost"
+	MSG_BUFFERED_SIZE  = 100
+	CHAN_SIZE          = 1
+	CONN_BUFFERED_SIZE = 1
+	SERVER_HOST        = "localhost"
 )
 
 type multiEchoServer struct {
@@ -29,7 +29,6 @@ type multiEchoServer struct {
 type compConn struct {
 	conn           net.Conn
 	chanRespBuffer chan string
-	chanConnClose  chan bool
 }
 
 // New creates and returns (but does not start) a new MultiEchoServer.
@@ -37,11 +36,11 @@ func New() MultiEchoServer {
 	// TODO: implement this!
 	mes := &multiEchoServer{
 		clientNum:     0,
-		chanStop:      make(chan bool, chanSizeUnit),
-		chanConnList:  make(chan net.Conn, chanSizeUnit),
-		chanRespMap:   make(map[net.Conn]compConn),
-		chanResp:      make(chan string, chanSizeUnit),
-		chanConnClose: make(chan net.Conn, connBufferedSize),
+		chanStop:      make(chan bool, CHAN_SIZE),
+		chanConnList:  make(chan net.Conn, CONN_BUFFERED_SIZE),
+		chanRespMap:   make(map[net.Conn]compConn, CONN_BUFFERED_SIZE),
+		chanResp:      make(chan string, CONN_BUFFERED_SIZE),
+		chanConnClose: make(chan net.Conn, CONN_BUFFERED_SIZE),
 	}
 	return MultiEchoServer(mes)
 }
@@ -53,7 +52,7 @@ func (mes *multiEchoServer) Start(port int) error {
 		fmt.Printf("%v\n", err)
 		return err
 	}
-	mes.ln = ln
+	// mes.ln = ln
 	go mes.handleStuff()
 	go mes.handleResp()
 	go func() {
@@ -65,6 +64,7 @@ func (mes *multiEchoServer) Start(port int) error {
 				continue
 			}
 			mes.chanConnList <- conn
+
 			go mes.handleConn(conn)
 		}
 	}()
@@ -73,6 +73,7 @@ func (mes *multiEchoServer) Start(port int) error {
 
 func (mes *multiEchoServer) Close() {
 	// TODO: implement this!
+	fmt.Printf("server Close called..\n")
 	mes.chanStop <- true
 }
 
@@ -81,7 +82,8 @@ func (mes *multiEchoServer) Count() int {
 	return mes.clientNum
 }
 
-// TODO: add additional methods/functions below
+// TODO: add additional methods/functions below!
+
 func (mes *multiEchoServer) handleConn(conn net.Conn) {
 	fmt.Println("Reading from connection..")
 
@@ -95,33 +97,27 @@ func (mes *multiEchoServer) handleConn(conn net.Conn) {
 		mes.chanResp <- msg
 	}
 	mes.chanConnClose <- conn
-	fmt.Printf("connection %v is exiting..\n", conn)
 }
 
 func (mes *multiEchoServer) handleResp() {
 	for {
 		msg := <-mes.chanResp
-		for _, cc := range mes.chanRespMap {
+		for con, cc := range mes.chanRespMap {
 			select {
-			case <-cc.chanConnClose:
-				continue
 			case cc.chanRespBuffer <- msg:
 			default:
-				// fmt.Printf("discard message %v of connection %v, current pending message size = %v.\n", msg, con, len(cc.chanRespBuffer))
-				// return
+				fmt.Printf("discard message %v of connection %v, current pending message size = %v.\n", msg, con, len(cc.chanRespBuffer))
 			}
 		}
 	}
 }
 
 func (mes *multiEchoServer) echoResp(cc compConn) {
-	fmt.Printf("Begin loop echo response to %v.\n", cc.conn)
-	con := cc.conn
 	for {
+		con := cc.conn
 		msg := <-cc.chanRespBuffer
 		_, err := con.Write([]byte(string(msg)))
 		if err != nil {
-			fmt.Printf("error : %v", err)
 			return
 		}
 	}
@@ -134,24 +130,18 @@ func (mes *multiEchoServer) handleStuff() {
 			for _, cc := range mes.chanRespMap {
 				mes.chanConnClose <- cc.conn
 			}
-			mes.ln.Close()
+			// mes.ln.Close()
 			return
 		case con := <-mes.chanConnList:
 			if con != nil {
 				mes.clientNum++
-				mes.chanRespMap[con] = compConn{
-					conn:           con,
-					chanRespBuffer: make(chan string, msgBufferedSize),
-					chanConnClose:  make(chan bool, chanSizeUnit),
-				}
+				mes.chanRespMap[con] = compConn{conn: con, chanRespBuffer: make(chan string, MSG_BUFFERED_SIZE)}
 				go mes.echoResp(mes.chanRespMap[con])
 			}
 		case con := <-mes.chanConnClose:
 			if con != nil {
-				mes.chanRespMap[con].chanConnClose <- true
 				mes.clientNum--
 				delete(mes.chanRespMap, con)
-				fmt.Printf("connection %v exited..\n", con)
 				con.Close()
 			}
 		}
